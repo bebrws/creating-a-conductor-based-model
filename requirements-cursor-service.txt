@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+openai>=1.0
+huggingface_hub>=0.23
+# Local conductor inference (merged 16-bit model on MPS/CPU, or adapter on CUDA)
+torch>=2.4
+transformers>=4.51
