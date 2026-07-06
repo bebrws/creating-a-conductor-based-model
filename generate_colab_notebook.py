@@ -24,12 +24,12 @@ from pathlib import Path
 # Runtime mode flags
 # -----------------------------
 RUN_MODEL_LOAD = True
-RUN_SFT = True                 # safe short SFT smoke run by default
-RUN_GRPO = False               # turn on only after Cell 8 reports 3/3 valid local plans
+RUN_SFT = True
+RUN_GRPO = True                # enabled: gate is Cell 8's readiness check
 RUN_OPENROUTER_SMOKE = False   # one cheap API call if True
 RUN_OPENROUTER_DEMO = False    # executes a workflow with OpenRouter if True
-EXPORT_MERGED_16BIT = False    # optional full merged model export; uses much more disk/RAM
-PUSH_TO_HF = False             # uploads adapter + harness metadata after Cell 10 if True
+EXPORT_MERGED_16BIT = True     # merged model is required to serve on Apple Silicon
+PUSH_TO_HF = True              # uploads adapter + harness metadata after Cell 10
 PROJECT_SLUG = "mini-conductor-qwen3-router-sft-grpo-32k"  # stable Drive/HF namespace for this run family
 # Per-run tag so each run writes to its own subfolder and its own HF path, and never
 # overwrites a previous run. Defaults to a timestamp. Pin it to a fixed string (or set
@@ -71,7 +71,7 @@ GRPO_MAX_PROMPT_LENGTH = 768
 GRPO_MAX_COMPLETION_LENGTH = 256      # plans should be compact JSON, not long prose
 GRPO_WARMUP_STEPS = 2
 REQUIRE_GRPO_READY = True             # require Cell 8 to pass before spending GRPO credits
-GRPO_MIN_VALID_PLANS = 3              # Cell 8 has 3 smoke prompts
+GRPO_MIN_VALID_PLANS = 3              # Cell 8 has 3 short smoke prompts (+1 long-context probe)
 WORKER_MAX_TOKENS_TRAIN = 512
 WORKER_MAX_TOKENS_EVAL = 1024
 
@@ -96,7 +96,7 @@ for p in [ROOT, CHECKPOINT_DIR, CACHE_DIR, EVAL_DIR, HARNESS_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------
-# API key
+# API keys
 # -----------------------------
 if (RUN_OPENROUTER_SMOKE or RUN_OPENROUTER_DEMO or RUN_GRPO) and not os.getenv('OPENROUTER_API_KEY'):
     os.environ['OPENROUTER_API_KEY'] = getpass('OpenRouter API key: ')
@@ -105,6 +105,7 @@ if PUSH_TO_HF and not os.getenv('HF_TOKEN'):
 
 print('ROOT:', ROOT)
 print('PROJECT_SLUG:', PROJECT_SLUG, '| RUN_TAG:', RUN_TAG)
+print('MAX_SEQ_LENGTH:', MAX_SEQ_LENGTH)
 print('RUN_MODEL_LOAD:', RUN_MODEL_LOAD, 'RUN_SFT:', RUN_SFT, 'RUN_GRPO:', RUN_GRPO)
 print('OpenRouter calls enabled:', RUN_OPENROUTER_SMOKE or RUN_OPENROUTER_DEMO or RUN_GRPO)
 ''')
@@ -1460,6 +1461,12 @@ if not os.getenv("HF_TOKEN"):
     os.environ["HF_TOKEN"] = getpass("Hugging Face write token: ")
 
 from huggingface_hub import HfApi, create_repo
+
+if "/" not in HF_REPO_ID:
+    # A bare repo name creates under your account but 404s on upload_folder;
+    # normalize to the token owner's namespace.
+    HF_REPO_ID = f"{HfApi(token=os.environ['HF_TOKEN']).whoami()['name']}/{HF_REPO_ID}"
+    print("HF_REPO_ID normalized to", HF_REPO_ID)
 
 _candidates = [("grpo", CHECKPOINT_DIR / "grpo_lora"), ("sft", CHECKPOINT_DIR / "sft_lora")]
 adapter_kind = adapter_dir = None

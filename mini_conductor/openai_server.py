@@ -25,6 +25,22 @@ logger = logging.getLogger("mini_conductor.openai_server")
 DEFAULT_MODEL_NAME = "mini-conductor-qwen3-router-sft-grpo"
 
 
+ADAPTER_ALLOW_PATTERNS = [
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "tokenizer*",
+    "chat_template.jinja",
+    "special_tokens_map.json",
+    "adapter/*",
+    "latest/adapter/*",
+    "runs/*/adapter/*",
+    "manifest.json",
+    "harness_artifacts/manifest.json",
+    "latest/harness_artifacts/manifest.json",
+    "runs/*/harness_artifacts/manifest.json",
+]
+
+
 def cached_snapshot(repo_id: str, allow_patterns: list[str], refresh: bool = False) -> Path:
     """snapshot_download, but offline-first: if every matching file is already in the
     local HF cache, return it without any network traffic (instant restarts). Only
@@ -40,6 +56,22 @@ def cached_snapshot(repo_id: str, allow_patterns: list[str], refresh: bool = Fal
     return Path(snapshot_download(repo_id, allow_patterns=allow_patterns))
 
 
+def merged_model_complete(merged_dir: Path) -> bool:
+    """True only if the merged model directory has ALL its weight shards. config.json
+    and the index arrive first during a download, so their presence alone does not
+    mean the multi-GB shards are there yet."""
+    if not (merged_dir / "config.json").exists():
+        return False
+    index_path = merged_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            shards = set(json.loads(index_path.read_text(encoding="utf-8"))["weight_map"].values())
+        except Exception:
+            return False
+        return all((merged_dir / shard).exists() for shard in shards)
+    return any(merged_dir.glob("*.safetensors"))
+
+
 def resolve_hf_conductor(hf_model_id: str, hf_run: str | None = None, refresh: bool = False) -> dict[str, Any]:
     """Download conductor artifacts (LoRA adapter + manifest) from a HF Hub repo.
 
@@ -51,37 +83,30 @@ def resolve_hf_conductor(hf_model_id: str, hf_run: str | None = None, refresh: b
     The multi-GB merged_16bit model is intentionally NOT downloaded here; it is
     fetched lazily only when the merged load path is actually used.
     """
-    local_root = cached_snapshot(
-        hf_model_id,
-        allow_patterns=[
-            "adapter_config.json",
-            "adapter_model.safetensors",
-            "tokenizer*",
-            "chat_template.jinja",
-            "special_tokens_map.json",
-            "adapter/*",
-            "latest/adapter/*",
-            "runs/*/adapter/*",
-            "manifest.json",
-            "harness_artifacts/manifest.json",
-            "latest/harness_artifacts/manifest.json",
-            "runs/*/harness_artifacts/manifest.json",
-        ],
-        refresh=refresh,
-    )
+    local_root = cached_snapshot(hf_model_id, allow_patterns=ADAPTER_ALLOW_PATTERNS, refresh=refresh)
 
-    candidates: list[Path] = []
-    if hf_run:
-        candidates.append(local_root / "runs" / hf_run / "adapter")
-    candidates.append(local_root / "latest" / "adapter")
-    runs_root = local_root / "runs"
-    if runs_root.exists():
-        # Run tags are timestamps, so lexicographic order is chronological.
-        candidates.extend(rd / "adapter" for rd in sorted(runs_root.iterdir(), reverse=True))
-    candidates.append(local_root / "adapter")
-    candidates.append(local_root)
+    def _adapter_candidates(root: Path) -> list[Path]:
+        candidates: list[Path] = []
+        if hf_run:
+            candidates.append(root / "runs" / hf_run / "adapter")
+        candidates.append(root / "latest" / "adapter")
+        runs_root = root / "runs"
+        if runs_root.exists():
+            # Run tags are timestamps, so lexicographic order is chronological.
+            candidates.extend(rd / "adapter" for rd in sorted(runs_root.iterdir(), reverse=True))
+        candidates.append(root / "adapter")
+        candidates.append(root)
+        return candidates
 
+    candidates = _adapter_candidates(local_root)
     adapter_dir = next((c for c in candidates if (c / "adapter_config.json").exists()), None)
+    if adapter_dir is None and not refresh:
+        # Offline-first resolution can succeed vacuously on a partial cache (it only
+        # sees files already downloaded). Retry against the Hub before giving up.
+        logger.info("No adapter in local cache for %s; checking the Hub", hf_model_id)
+        local_root = cached_snapshot(hf_model_id, allow_patterns=ADAPTER_ALLOW_PATTERNS, refresh=True)
+        candidates = _adapter_candidates(local_root)
+        adapter_dir = next((c for c in candidates if (c / "adapter_config.json").exists()), None)
     if adapter_dir is None:
         raise FileNotFoundError(
             f"No adapter_config.json found in Hugging Face repo {hf_model_id}"
@@ -258,7 +283,7 @@ class ConductorOpenAIService:
     def _ensure_merged_model(self) -> Path:
         """Locate (downloading if needed) the merged_16bit model directory."""
         merged_local = self.manifest.get("merged_16bit_dir")
-        if merged_local and Path(merged_local).exists():
+        if merged_local and merged_model_complete(Path(merged_local)):
             return Path(merged_local)
         if self._hf is None or self.hf_model_id is None:
             raise RuntimeError(
@@ -275,7 +300,15 @@ class ConductorOpenAIService:
         )
         local_root = cached_snapshot(self.hf_model_id, allow_patterns=[f"{prefix}/*"], refresh=False)
         merged_dir = local_root / prefix
-        if not (merged_dir / "config.json").exists():
+        if not merged_model_complete(merged_dir):
+            # The offline-first path can succeed vacuously or partially: local_files_only
+            # only sees files already in the cache, and config.json lands long before the
+            # multi-GB shards. Do a real Hub download (which resumes/waits on any download
+            # already in flight) before concluding the model is absent.
+            logger.info("Merged model missing or incomplete in local cache; downloading from the Hub (~16GB one-time, resumes partial downloads)")
+            local_root = cached_snapshot(self.hf_model_id, allow_patterns=[f"{prefix}/*"], refresh=True)
+            merged_dir = local_root / prefix
+        if not merged_model_complete(merged_dir):
             raise RuntimeError(
                 f"Repo {self.hf_model_id} has no merged model under {prefix}/. "
                 "Re-export with EXPORT_MERGED_16BIT=True (notebook Cell 10), or run this "
@@ -556,6 +589,7 @@ def create_app(service: ConductorOpenAIService, server_api_key: str | None = Non
         except Exception as e:
             # Orchestration/worker/budget failures map to a server error so Cursor
             # shows the real reason (e.g. budget guard, missing OPENROUTER_API_KEY).
+            logger.exception("Conductor request failed")
             return openai_error_response(500, str(e), "server_error")
 
         if not stream:
